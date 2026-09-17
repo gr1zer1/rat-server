@@ -1,171 +1,183 @@
+//! Приём и отображение видеокадров от подключённых камер.
+//!
+//! Камера отправляет JPEG-кадры в маршрут `/camera/<имя_компьютера>`.
+//! Сервер хранит только последний кадр каждого компьютера, не записывая видео на диск.
 
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::Router;
-use minifb::{Key, Window, WindowOptions};
 
-/// Один декодированный кадр, готовый к отрисовке в окне.
-struct FrameMsg {
-    width: usize,
-    height: usize,
-    /// Буфер в формате 0x00RRGGBB на пиксель — то, что ожидает minifb
-    buffer: Vec<u32>,
+use crate::protocol::ServerToAgent;
+use crate::server::AppState;
+
+/// Последний кадр конкретного компьютера в формате, понятном `egui`.
+pub struct CameraFrame {
+    image: egui::ColorImage,
 }
 
-#[derive(Clone)]
-struct AppState {
-    frame_tx: Sender<FrameMsg>,
+/// Общая память для видеокадров. В ней хранится ровно один кадр на камеру.
+pub type CameraFrames = Arc<Mutex<HashMap<String, CameraFrame>>>;
+
+/// Создаёт пустое хранилище кадров при запуске сервера.
+pub fn new_camera_frames() -> CameraFrames {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
-fn main() {
-    // std::sync::mpsc — канал между async-миром Axum (tokio) и синхронным окном minifb.
-    // Окно должно жить и обновляться на главном потоке, поэтому Axum-сервер уезжает
-    // на отдельный поток со своим tokio-рантаймом.
-    let (frame_tx, frame_rx) = channel::<FrameMsg>();
-    let state = AppState { frame_tx };
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
-        rt.block_on(run_server(state));
-    });
-
-    run_window(frame_rx);
+/// WebSocket-обработчик для камеры. Имя берётся из URL, например `/camera/PC-12`.
+pub async fn camera_ws_handler(
+    Path(camera_name): Path<String>,
+    ws: WebSocketUpgrade,
+    State(state): State<crate::server::AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| receive_frames(socket, camera_name, state.camera_frames))
 }
 
-async fn run_server(state: AppState) {
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000")
-        .await
-        .expect("failed to bind port 8000");
-
-    println!("listening on ws://0.0.0.0:8000/ws");
-    axum::serve(listener, app).await.expect("server error");
-}
-
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
-}
-
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Диагностика: считаем реальный fps приёма и время декодирования,
-    // чтобы понять, где узкое место — сеть/клиент или декодирование/отрисовка.
-    let mut frames_received = 0u32;
-    let mut window_start = Instant::now();
-    let mut decode_time_total = std::time::Duration::ZERO;
-
-    while let Some(msg) = socket.recv().await {
-        let recv_at = Instant::now();
-
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("websocket recv error: {e}");
-                break;
-            }
+/// Принимает JPEG-кадры. Старый кадр сразу заменяется свежим.
+async fn receive_frames(mut socket: WebSocket, camera_name: String, frames: CameraFrames) {
+    println!("камера подключена: {camera_name}");
+    while let Some(message) = socket.recv().await {
+        let Ok(Message::Binary(jpeg)) = message else {
+            continue;
         };
-
-        let data = match msg {
-            Message::Binary(bytes) => bytes,
-            Message::Close(_) => break,
-            _ => continue, // текстовые/ping-сообщения нас тут не интересуют
-        };
-
-        let bytes_len = data.len();
-        let decode_start = Instant::now();
-
-        match image::load_from_memory_with_format(&data, image::ImageFormat::Jpeg) {
-            Ok(img) => {
-                let rgb = img.to_rgb8();
-                let width = rgb.width() as usize;
-                let height = rgb.height() as usize;
-                let buffer = rgb_to_minifb_buffer(&rgb);
-                decode_time_total += decode_start.elapsed();
-
-                // Если окно ещё не забирает кадры (например, закрывается), просто пропускаем —
-                // это не должно рвать соединение с клиентом.
-                let _ = state.frame_tx.send(FrameMsg {
-                    width,
-                    height,
-                    buffer,
-                });
+        match image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg) {
+            Ok(decoded) => {
+                let rgb = decoded.to_rgb8();
+                let size = [rgb.width() as usize, rgb.height() as usize];
+                let image = egui::ColorImage::from_rgb(size, rgb.as_raw());
+                frames
+                    .lock()
+                    .unwrap()
+                    .insert(camera_name.clone(), CameraFrame { image });
             }
-            Err(e) => eprintln!("failed to decode JPEG frame: {e}"),
-        }
-
-        frames_received += 1;
-        let _ = recv_at; // зарезервировано, если понадобится точнее замерить время между recv() и получением байт
-
-        if window_start.elapsed().as_secs() >= 1 {
-            let fps = frames_received;
-            let avg_decode_ms = if fps > 0 {
-                decode_time_total.as_secs_f64() * 1000.0 / fps as f64
-            } else {
-                0.0
-            };
-            println!(
-                "[diag] received fps: {fps}, avg decode: {avg_decode_ms:.2}ms, last frame size: {bytes_len} bytes"
-            );
-            frames_received = 0;
-            decode_time_total = std::time::Duration::ZERO;
-            window_start = Instant::now();
+            Err(error) => eprintln!("не удалось декодировать кадр от {camera_name}: {error}"),
         }
     }
+    // Не показываем устаревший стоп-кадр после отключения камеры.
+    frames.lock().unwrap().remove(&camera_name);
+    println!("камера отключена: {camera_name}");
 }
 
-/// Конвертирует RGB-изображение в плоский буфер u32 (0x00RRGGBB на пиксель),
-/// как того требует minifb.
-fn rgb_to_minifb_buffer(img: &image::RgbImage) -> Vec<u32> {
-    img.pixels()
-        .map(|p| {
-            let [r, g, b] = p.0;
-            ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
-        })
-        .collect()
+/// UI отдельного окна «Камеры».
+pub struct CameraView {
+    state: AppState,
+    selected_camera: Option<String>,
+    /// Камеры, которые были включены именно этим окном и должны быть выключены при закрытии.
+    requested_cameras: HashSet<String>,
+    texture: Option<egui::TextureHandle>,
+    texture_camera: Option<String>,
 }
 
-/// Цикл окна на главном потоке: берёт самый свежий кадр из канала и рисует его.
-fn run_window(rx: Receiver<FrameMsg>) {
-    let mut width = 640usize;
-    let mut height = 480usize;
-    let mut buffer: Vec<u32> = vec![0; width * height];
-
-    let mut window = Window::new("Camera Stream", width, height, WindowOptions::default())
-        .expect("failed to create window");
-
-    // Ограничиваем частоту перерисовки, чтобы не грузить CPU впустую
-    window.set_target_fps(60);
-
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Забираем ВСЕ накопившиеся кадры и оставляем только последний —
-        // так окно не будет "отставать", даже если кадры приходят быстрее, чем рисуется окно.
-        let mut latest: Option<FrameMsg> = None;
-        while let Ok(frame) = rx.try_recv() {
-            latest = Some(frame);
+impl CameraView {
+    pub fn new(state: AppState) -> Self {
+        Self {
+            state,
+            selected_camera: None,
+            requested_cameras: HashSet::new(),
+            texture: None,
+            texture_camera: None,
         }
+    }
 
-        if let Some(frame) = latest {
-            if frame.width != width || frame.height != height {
-                // Разрешение сменилось (например, переподключился другой клиент) —
-                // пересоздаём окно под новый размер.
-                width = frame.width;
-                height = frame.height;
-                window = Window::new("Camera Stream", width, height, WindowOptions::default())
-                    .expect("failed to recreate window");
-                window.set_target_fps(60);
+    /// Рисует выбор компьютера и его последний кадр.
+    pub fn ui(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("camera_list")
+            .min_width(190.0)
+            .show(ctx, |ui| {
+                ui.heading("Компьютеры");
+                ui.separator();
+                let mut names: Vec<String> =
+                    self.state.agents.lock().unwrap().keys().cloned().collect();
+                names.sort();
+                if names.is_empty() {
+                    ui.weak("Нет подключённых компьютеров");
+                }
+                for name in names {
+                    let selected = self.selected_camera.as_deref() == Some(name.as_str());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(selected, format!("📷  {name}"))
+                            .clicked()
+                        {
+                            self.selected_camera = Some(name.clone());
+                        }
+                        if self.requested_cameras.contains(&name) {
+                            if ui.small_button("Выключить").clicked() {
+                                self.stop_camera(&name);
+                            }
+                        } else if ui.small_button("Включить просмотр").clicked() {
+                            self.start_camera(&name);
+                        }
+                    });
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(camera_name) = self.selected_camera.clone() else {
+                ui.centered_and_justified(|ui| ui.weak("Выберите камеру слева"));
+                return;
+            };
+            let frame = self
+                .state
+                .camera_frames
+                .lock()
+                .unwrap()
+                .get(&camera_name)
+                .map(|frame| frame.image.clone());
+            let Some(frame) = frame else {
+                self.texture = None;
+                ui.centered_and_justified(|ui| {
+                    ui.weak("Ожидание кадра: нажмите «Включить просмотр»")
+                });
+                return;
+            };
+
+            ui.heading(format!("Камера: {camera_name}"));
+            ui.separator();
+            if self.texture_camera.as_deref() != Some(camera_name.as_str()) {
+                self.texture =
+                    Some(ctx.load_texture("camera_stream", frame, egui::TextureOptions::LINEAR));
+                self.texture_camera = Some(camera_name);
+            } else if let Some(texture) = &mut self.texture {
+                texture.set(frame, egui::TextureOptions::LINEAR);
             }
-            buffer = frame.buffer;
-        }
+            if let Some(texture) = &self.texture {
+                let available = ui.available_size();
+                let original = texture.size_vec2();
+                let scale = (available.x / original.x)
+                    .min(available.y / original.y)
+                    .min(1.0);
+                ui.image((texture.id(), original * scale));
+            }
+        });
+    }
 
-        window
-            .update_with_buffer(&buffer, width, height)
-            .expect("failed to update window buffer");
+    /// Останавливает все камеры, которые были включены в этом окне.
+    pub fn stop_all(&mut self) {
+        let names: Vec<String> = self.requested_cameras.drain().collect();
+        for name in names {
+            self.send_command(&name, ServerToAgent::StopCamera);
+        }
+        self.selected_camera = None;
+        self.texture = None;
+    }
+
+    fn start_camera(&mut self, name: &str) {
+        self.send_command(name, ServerToAgent::StartCamera);
+        self.requested_cameras.insert(name.to_owned());
+        self.selected_camera = Some(name.to_owned());
+    }
+
+    fn stop_camera(&mut self, name: &str) {
+        self.send_command(name, ServerToAgent::StopCamera);
+        self.requested_cameras.remove(name);
+    }
+
+    fn send_command(&self, name: &str, command: ServerToAgent) {
+        if let Some(agent) = self.state.agents.lock().unwrap().get(name) {
+            let _ = agent.cmd_tx.send(command);
+        }
     }
 }

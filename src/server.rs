@@ -9,6 +9,7 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
+use crate::camera::{self, CameraFrames};
 use crate::protocol::{AgentToServer, ProcessInfo, ServerToAgent};
 
 /// Состояние одного подключённого агента, как его видит GUI.
@@ -23,12 +24,15 @@ pub struct AgentEntry {
 #[derive(Clone)]
 pub struct AppState {
     pub agents: Arc<Mutex<HashMap<String, AgentEntry>>>,
+    /// Последние кадры камер для окна видеонаблюдения.
+    pub camera_frames: CameraFrames,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
+            camera_frames: camera::new_camera_frames(),
         }
     }
 }
@@ -38,6 +42,9 @@ impl AppState {
 pub async fn run_server(state: AppState) {
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        // Бинарные JPEG-кадры камер не смешиваются с JSON-командами обычных агентов.
+        // В axum 0.7 параметр пути записывается как `:name`.
+        .route("/camera/:name", get(camera::camera_ws_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8000")

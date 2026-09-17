@@ -14,7 +14,13 @@ pub struct ProcessInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerToAgent {
     ListTasks,
-    KillTask { pid: u32 },
+    KillTask {
+        pid: u32,
+    },
+    /// Явно включает передачу камеры на выбранном компьютере.
+    StartCamera,
+    /// Немедленно останавливает передачу камеры и освобождает устройство.
+    StopCamera,
 }
 
 /// Сообщения, которые агент отправляет учителю.
